@@ -27,7 +27,7 @@ class SemiFuture;
 
 template <typename T>
 struct isSemiFuture : std::false_type {
-  using Inner = typename lift_unit<T>::type;
+  using Inner = lift_unit_t<T>;
 };
 
 template <typename T>
@@ -37,7 +37,7 @@ struct isSemiFuture<SemiFuture<T>> : std::true_type {
 
 template <typename T>
 struct isFuture : std::false_type {
-  using Inner = typename lift_unit<T>::type;
+  using Inner = lift_unit_t<T>;
 };
 
 template <typename T>
@@ -47,7 +47,7 @@ struct isFuture<Future<T>> : std::true_type {
 
 template <typename T>
 struct isFutureOrSemiFuture : std::false_type {
-  using Inner = typename lift_unit<T>::type;
+  using Inner = lift_unit_t<T>;
   using Return = Inner;
 };
 
@@ -88,10 +88,15 @@ struct ArgType<> {
   typedef void FirstArg;
 };
 
-template <bool isTry, typename F, typename... Args>
+template <bool isTry_, typename F, typename... Args>
 struct argResult {
+  using Function = F;
   using ArgList = ArgType<Args...>;
   using Result = invoke_result_t<F, Args...>;
+  using ArgsSize = index_constant<sizeof...(Args)>;
+  static constexpr bool isTry() {
+    return isTry_;
+  }
 };
 
 template <typename T, typename F>
@@ -107,9 +112,23 @@ struct callableResult {
   typedef Future<typename ReturnsFuture::Inner> Return;
 };
 
-template <typename T, typename F>
+template <
+    typename T,
+    typename F,
+    typename = std::enable_if_t<is_invocable<F, Try<T>&&>::value>>
 struct tryCallableResult {
   typedef detail::argResult<true, F, Try<T>&&> Arg;
+  typedef isFutureOrSemiFuture<typename Arg::Result> ReturnsFuture;
+  typedef typename ReturnsFuture::Inner value_type;
+  typedef Future<value_type> Return;
+};
+
+template <
+    typename T,
+    typename F,
+    typename = std::enable_if_t<is_invocable<F, Executor*, Try<T>&&>::value>>
+struct tryExecutorCallableResult {
+  typedef detail::argResult<true, F, Executor*, Try<T>&&> Arg;
   typedef isFutureOrSemiFuture<typename Arg::Result> ReturnsFuture;
   typedef typename ReturnsFuture::Inner value_type;
   typedef Future<value_type> Return;

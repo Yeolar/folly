@@ -34,7 +34,7 @@ class Baton::FiberWaiter : public Baton::Waiter {
   Fiber* fiber_{nullptr};
 };
 
-inline Baton::Baton() : Baton(NO_WAITER) {
+inline Baton::Baton() noexcept : Baton(NO_WAITER) {
   assert(Baton(NO_WAITER).futex_.futex == static_cast<uint32_t>(NO_WAITER));
   assert(Baton(POSTED).futex_.futex == static_cast<uint32_t>(POSTED));
   assert(Baton(TIMEOUT).futex_.futex == static_cast<uint32_t>(TIMEOUT));
@@ -76,31 +76,22 @@ bool Baton::try_wait_for(
     const std::chrono::duration<Rep, Period>& timeout,
     F&& mainContextFunc) {
   auto fm = FiberManager::getFiberManagerUnsafe();
+  auto timeoutMs =
+      std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
 
   if (!fm || !fm->activeFiber_) {
     mainContextFunc();
-    return timedWaitThread(timeout);
+    return timedWaitThread(timeoutMs);
   }
 
-  auto& baton = *this;
-  bool canceled = false;
-  auto timeoutFunc = [&baton, &canceled]() mutable {
-    baton.postHelper(TIMEOUT);
-    canceled = true;
-  };
+  auto timeoutFunc = [this]() mutable { this->postHelper(TIMEOUT); };
+  TimeoutHandler handler;
+  handler.timeoutFunc_ = std::ref(timeoutFunc);
 
-  auto id =
-      fm->timeoutManager_->registerTimeout(std::ref(timeoutFunc), timeout);
-
+  fm->loopController_->timer().scheduleTimeout(&handler, timeoutMs);
   waitFiber(*fm, static_cast<F&&>(mainContextFunc));
 
-  auto posted = waiter_ == POSTED;
-
-  if (!canceled) {
-    fm->timeoutManager_->cancel(id);
-  }
-
-  return posted;
+  return waiter_ == POSTED;
 }
 
 template <typename Clock, typename Duration, typename F>

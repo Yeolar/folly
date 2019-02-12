@@ -844,7 +844,7 @@ toAppendDelimStrImpl(const Delimiter& delim, const T& v, const Ts&... vs) {
 
 /**
  * Variadic conversion to string. Appends each element in turn.
- * If we have two or more things to append, we it will not reserve
+ * If we have two or more things to append, we will not reserve
  * the space for them and will depend on strings exponential growth.
  * If you just append once consider using toAppendFit which reserves
  * the space needed (but does not have exponential as a result).
@@ -1216,8 +1216,8 @@ typename std::enable_if<
     Expected<Tgt, ConversionCode>>::type
 convertTo(const Src& value) noexcept {
   if /* constexpr */ (
-      folly::_t<std::make_unsigned<Tgt>>(std::numeric_limits<Tgt>::max()) <
-      folly::_t<std::make_unsigned<Src>>(std::numeric_limits<Src>::max())) {
+      std::make_unsigned_t<Tgt>(std::numeric_limits<Tgt>::max()) <
+      std::make_unsigned_t<Src>(std::numeric_limits<Src>::max())) {
     if (greater_than<Tgt, std::numeric_limits<Tgt>::max()>(value)) {
       return makeUnexpected(ConversionCode::ARITH_POSITIVE_OVERFLOW);
     }
@@ -1335,7 +1335,7 @@ convertTo(const Src& value) noexcept {
 
 template <typename Tgt, typename Src>
 inline std::string errorValue(const Src& value) {
-#ifdef FOLLY_HAS_RTTI
+#if FOLLY_HAS_RTTI
   return to<std::string>("(", demangle(typeid(Tgt)), ") ", value);
 #else
   return to<std::string>(value);

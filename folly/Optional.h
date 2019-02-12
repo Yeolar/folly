@@ -71,15 +71,20 @@ template <class Value>
 class Optional;
 
 namespace detail {
-struct NoneHelper {};
-
 template <class Value>
 struct OptionalPromiseReturn;
 } // namespace detail
 
-typedef int detail::NoneHelper::*None;
+struct None {
+  enum class _secret { _token };
 
-const None none = {};
+  /**
+   * No default constructor to support both `op = {}` and `op = none`
+   * as syntax for clearing an Optional, just like std::nullopt_t.
+   */
+  explicit constexpr None(_secret) {}
+};
+constexpr None none{None::_secret::_token};
 
 class FOLLY_EXPORT OptionalEmptyException : public std::runtime_error {
  public:
@@ -128,11 +133,40 @@ class Optional {
     construct(newValue);
   }
 
+  /**
+   * Explicitly disallow converting nullptr to non-pointer
+   * types. Optional used to support initialization from nullptr as if
+   * it were folly::none. Without this constructor,
+   * folly::Optional<bool> could be constructed from nullptr,
+   * producing {false} instead of {}. This would be a change in
+   * behavior from the old code, so explicitly disallow it. Note that
+   * std::optional<bool> can be constructed from nullptr, also
+   * producing {false}.
+   *
+   * This constructor is temporary and should be removed when all call
+   * sites are fixed.
+   */
+  template <typename Null = std::nullptr_t>
+  /* implicit */
+  Optional(typename std::enable_if<
+           std::is_convertible<Null, Value>::value,
+           Null>::type) noexcept = delete;
+
   template <typename... Args>
   FOLLY_CPP14_CONSTEXPR explicit Optional(in_place_t, Args&&... args) noexcept(
-      std::is_nothrow_constructible<Value, Args...>::value) {
-    construct(std::forward<Args>(args)...);
-  }
+      std::is_nothrow_constructible<Value, Args...>::value)
+      : Optional{PrivateConstructor{}, std::forward<Args>(args)...} {}
+
+  template <typename U, typename... Args>
+  FOLLY_CPP14_CONSTEXPR explicit Optional(
+      in_place_t,
+      std::initializer_list<U> il,
+      Args&&... args) noexcept(std::
+                                   is_nothrow_constructible<
+                                       Value,
+                                       std::initializer_list<U>,
+                                       Args...>::value)
+      : Optional{PrivateConstructor{}, il, std::forward<Args>(args)...} {}
 
   // Used only when an Optional is used with coroutines on MSVC
   /* implicit */ Optional(const detail::OptionalPromiseReturn<Value>& p)
@@ -177,6 +211,11 @@ class Optional {
     } else {
       construct(newValue);
     }
+  }
+
+  Optional& operator=(None) noexcept {
+    reset();
+    return *this;
   }
 
   template <class Arg>
@@ -315,6 +354,30 @@ class Optional {
   }
 
  private:
+  template <class T>
+  friend constexpr Optional<std::decay_t<T>> make_optional(T&&);
+  template <class T, class... Args>
+  friend constexpr Optional<T> make_optional(Args&&... args);
+  template <class T, class U, class... As>
+  friend constexpr Optional<T> make_optional(std::initializer_list<U>, As&&...);
+
+  /**
+   * Construct the optional in place, this is duplicated as a non-explicit
+   * constructor to allow returning values that are non-movable from
+   * make_optional using list initialization.
+   *
+   * Until C++17, at which point this will become unnecessary because of
+   * specified prvalue elision.
+   */
+  struct PrivateConstructor {
+    explicit PrivateConstructor() = default;
+  };
+  template <typename... Args>
+  FOLLY_CPP14_CONSTEXPR Optional(PrivateConstructor, Args&&... args) noexcept(
+      std::is_constructible<Value, Args&&...>::value) {
+    construct(std::forward<Args>(args)...);
+  }
+
   void require_value() const {
     if (!storage_.hasValue) {
       throw_exception<OptionalEmptyException>();
@@ -349,17 +412,10 @@ class Optional {
     };
     bool hasValue;
 
-    FOLLY_PUSH_WARNING
-    // These are both informational warnings, but they trigger rare
-    // enough that we've left them enabled. Needed as long as MSVC
-    // 2015 is supported.
-    FOLLY_MSVC_DISABLE_WARNING(4587) // constructor of .value is not called
-    FOLLY_MSVC_DISABLE_WARNING(4588) // destructor of .value is not called
     StorageNonTriviallyDestructible() : hasValue{false} {}
     ~StorageNonTriviallyDestructible() {
       clear();
     }
-    FOLLY_POP_WARNING
 
     void clear() {
       if (hasValue) {
@@ -392,9 +448,25 @@ void swap(Optional<T>& a, Optional<T>& b) noexcept(noexcept(a.swap(b))) {
   a.swap(b);
 }
 
-template <class T, class Opt = Optional<typename std::decay<T>::type>>
-constexpr Opt make_optional(T&& v) {
-  return Opt(std::forward<T>(v));
+template <class T>
+constexpr Optional<std::decay_t<T>> make_optional(T&& v) {
+  using PrivateConstructor =
+      typename folly::Optional<std::decay_t<T>>::PrivateConstructor;
+  return {PrivateConstructor{}, std::forward<T>(v)};
+}
+
+template <class T, class... Args>
+constexpr folly::Optional<T> make_optional(Args&&... args) {
+  using PrivateConstructor = typename folly::Optional<T>::PrivateConstructor;
+  return {PrivateConstructor{}, std::forward<Args>(args)...};
+}
+
+template <class T, class U, class... Args>
+constexpr folly::Optional<T> make_optional(
+    std::initializer_list<U> il,
+    Args&&... args) {
+  using PrivateConstructor = typename folly::Optional<T>::PrivateConstructor;
+  return {PrivateConstructor{}, il, std::forward<Args>(args)...};
 }
 
 ///////////////////////////////////////////////////////////////////////////////

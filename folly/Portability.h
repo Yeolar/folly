@@ -18,9 +18,8 @@
 
 #include <cstddef>
 
-#include <folly/portability/Config.h>
-
 #include <folly/CPortability.h>
+#include <folly/portability/Config.h>
 
 // Unaligned loads and stores
 namespace folly {
@@ -107,7 +106,13 @@ constexpr bool kIsArchPPC64 = FOLLY_PPC64 == 1;
 
 namespace folly {
 
-#if FOLLY_SANITIZE_ADDRESS
+/**
+ * folly::kIsSanitizeAddress reports if folly was compiled with ASAN
+ * enabled.  Note that for compilation units outside of folly that include
+ * folly/Portability.h, the value of kIsSanitizeAddress may be different
+ * from whether or not the current compilation unit is being compiled with ASAN.
+ */
+#if FOLLY_ASAN_ENABLED
 constexpr bool kIsSanitizeAddress = true;
 #else
 constexpr bool kIsSanitizeAddress = false;
@@ -251,12 +256,40 @@ FOLLY_GCC_DISABLE_NEW_SHADOW_WARNINGS
 
 #endif
 
+// Define FOLLY_HAS_EXCEPTIONS
+#if __cpp_exceptions >= 199711 || FOLLY_HAS_FEATURE(cxx_exceptions)
+#define FOLLY_HAS_EXCEPTIONS 1
+#elif __GNUC__
+#if __EXCEPTIONS
+#define FOLLY_HAS_EXCEPTIONS 1
+#else // __EXCEPTIONS
+#define FOLLY_HAS_EXCEPTIONS 0
+#endif // __EXCEPTIONS
+#elif FOLLY_MICROSOFT_ABI_VER
+#if _CPPUNWIND
+#define FOLLY_HAS_EXCEPTIONS 1
+#else // _CPPUNWIND
+#define FOLLY_HAS_EXCEPTIONS 0
+#endif // _CPPUNWIND
+#else
+#define FOLLY_HAS_EXCEPTIONS 1 // default assumption for unknown platforms
+#endif
+
 // Debug
 namespace folly {
 #ifdef NDEBUG
 constexpr auto kIsDebug = false;
 #else
 constexpr auto kIsDebug = true;
+#endif
+} // namespace folly
+
+// Exceptions
+namespace folly {
+#if FOLLY_HAS_EXCEPTIONS
+constexpr auto kHasExceptions = true;
+#else
+constexpr auto kHasExceptions = false;
 #endif
 } // namespace folly
 
@@ -325,6 +358,8 @@ using namespace FOLLY_GFLAGS_NAMESPACE;
 #if defined(__GXX_RTTI) || defined(__cpp_rtti) || \
     (defined(_MSC_VER) && defined(_CPPRTTI))
 #define FOLLY_HAS_RTTI 1
+#else
+#define FOLLY_HAS_RTTI 0
 #endif
 
 #if defined(__APPLE__) || defined(_MSC_VER)
@@ -429,12 +464,16 @@ constexpr auto kCpplibVer = 0;
 //    extern int const num;
 //    FOLLY_STORAGE_CONSTEXPR int const num = 3;
 //
-//  True for MSVC 2015 and MSVC 2017.
+//  True as of MSVC 2017.
 #if _MSC_VER
 #define FOLLY_STORAGE_CONSTEXPR
 #define FOLLY_STORAGE_CPP14_CONSTEXPR
 #else
+#if __ICC
+#define FOLLY_STORAGE_CONSTEXPR
+#else
 #define FOLLY_STORAGE_CONSTEXPR constexpr
+#endif
 #if FOLLY_USE_CPP14_CONSTEXPR
 #define FOLLY_STORAGE_CPP14_CONSTEXPR constexpr
 #else
@@ -454,21 +493,19 @@ constexpr auto kCpplibVer = 0;
 #define FOLLY_HAVE_NOEXCEPT_FUNCTION_TYPE 1
 #endif
 
-// Define FOLLY_HAS_EXCEPTIONS
-#if __cpp_exceptions >= 199711 || FOLLY_HAS_FEATURE(cxx_exceptions)
-#define FOLLY_HAS_EXCEPTIONS 1
-#elif __GNUC__
-#if __EXCEPTIONS
-#define FOLLY_HAS_EXCEPTIONS 1
-#else // __EXCEPTIONS
-#define FOLLY_HAS_EXCEPTIONS 0
-#endif // __EXCEPTIONS
-#elif FOLLY_MICROSOFT_ABI_VER
-#if _CPPUNWIND
-#define FOLLY_HAS_EXCEPTIONS 1
-#else // _CPPUNWIND
-#define FOLLY_HAS_EXCEPTIONS 0
-#endif // _CPPUNWIND
+// feature test __cpp_lib_string_view is defined in <string>, which is
+// too heavy to include here.  MSVC __has_include support arrived later
+// than string_view, so we need an alternate case for it.
+#ifdef __has_include
+#if __has_include(<string_view>) && __cplusplus >= 201703L
+#define FOLLY_HAS_STRING_VIEW 1
 #else
-#define FOLLY_HAS_EXCEPTIONS 1 // default assumption for unknown platforms
+#define FOLLY_HAS_STRING_VIEW 0
 #endif
+#else // __has_include
+#if _MSC_VER >= 1910 && (_MSVC_LANG > 201402 || __cplusplus > 201402)
+#define FOLLY_HAS_STRING_VIEW 1
+#else
+#define FOLLY_HAS_STRING_VIEW 0
+#endif
+#endif // __has_include

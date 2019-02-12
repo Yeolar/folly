@@ -28,13 +28,14 @@ namespace folly {
 
 TEST(AsyncSocketTest, getSockOpt) {
   EventBase evb;
-  std::shared_ptr<AsyncSocket> socket = AsyncSocket::newSocket(&evb, 0);
+  std::shared_ptr<AsyncSocket> socket =
+      AsyncSocket::newSocket(&evb, folly::NetworkSocket::fromFd(0));
 
   int val;
   socklen_t len;
 
-  int expectedRc =
-      getsockopt(socket->getFd(), SOL_SOCKET, SO_REUSEADDR, &val, &len);
+  int expectedRc = getsockopt(
+      socket->getNetworkSocket().toFd(), SOL_SOCKET, SO_REUSEADDR, &val, &len);
   int actualRc = socket->getSockOpt(SOL_SOCKET, SO_REUSEADDR, &val, &len);
 
   EXPECT_EQ(expectedRc, actualRc);
@@ -95,7 +96,7 @@ TEST(AsyncSocketTest, tosReflect) {
   auto server1 = AsyncServerSocket::newSocket(&base);
   server1->bind(0);
   server1->listen(10);
-  int fd = server1->getSocket();
+  int fd = server1->getNetworkSocket().toFd();
 
   // Verify if tos reflect is disabled by default
   // and the TCP_SAVE_SYN setting is not enabled

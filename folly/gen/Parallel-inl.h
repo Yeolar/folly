@@ -15,7 +15,7 @@
  */
 
 #ifndef FOLLY_GEN_PARALLEL_H_
-#error This file may only be included from folly/gen/ParallelGen.h
+#error This file may only be included from folly/gen/Parallel.h
 #endif
 
 #include <folly/MPMCQueue.h>
@@ -172,11 +172,12 @@ class Parallel : public Operator<Parallel<Ops>> {
                             Composed,
                             Output,
                             OutputDecayed>> {
-    const Source source_;
-    const Ops ops_;
-    const size_t threads_;
-    typedef ClosableMPMCQueue<InputDecayed> InQueue;
-    typedef ClosableMPMCQueue<OutputDecayed> OutQueue;
+    Source source_;
+    Ops ops_;
+    size_t threads_;
+
+    using InQueue = ClosableMPMCQueue<InputDecayed>;
+    using OutQueue = ClosableMPMCQueue<OutputDecayed>;
 
     class Puller : public GenImpl<InputDecayed&&, Puller> {
       InQueue* queue_;

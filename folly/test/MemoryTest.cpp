@@ -35,6 +35,12 @@ static constexpr std::size_t kTooBig = folly::constexpr_max(
     std::size_t{std::numeric_limits<uint32_t>::max()},
     std::size_t{1} << (8 * sizeof(std::size_t) - 14));
 
+TEST(allocateBytes, simple) {
+  auto p = allocateBytes(10);
+  EXPECT_TRUE(p != nullptr);
+  deallocateBytes(p, 10);
+}
+
 TEST(aligned_malloc, examples) {
   auto trial = [](size_t align) {
     auto const ptr = aligned_malloc(1, align);
@@ -165,6 +171,13 @@ TEST(AlignedSysAllocator, bad_alloc_default) {
   if (!kIsSanitize) {
     EXPECT_THROW(nums.reserve(kTooBig), std::bad_alloc);
   }
+}
+
+TEST(AlignedSysAllocator, converting_constructor) {
+  using Alloc1 = AlignedSysAllocator<float>;
+  using Alloc2 = AlignedSysAllocator<double>;
+  Alloc1 const alloc1(1024);
+  Alloc2 const alloc2(alloc1);
 }
 
 TEST(allocate_sys_buffer, compiles) {

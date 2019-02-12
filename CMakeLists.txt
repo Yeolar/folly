@@ -49,17 +49,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
     message(FATAL_ERROR "Folly requires a 64bit target architecture.")
   endif()
 
-  if (MSVC_VERSION GREATER_EQUAL 1910 AND MSVC_VERSION LESS 1920)
-    set(MSVC_IS_2015 OFF)
-    set(MSVC_IS_2017 ON)
-  elseif (MSVC_VERSION EQUAL 1900)
-    set(MSVC_IS_2015 ON)
-    set(MSVC_IS_2017 OFF)
-  else()
+  if (MSVC_VERSION LESS 1900)
     message(
       FATAL_ERROR
       "This build script only supports building Folly on 64-bit Windows with "
-      "Visual Studio 2015 or Visual Studio 2017. "
+      "at least Visual Studio 2017. "
       "MSVC version '${MSVC_VERSION}' is not supported."
     )
   endif()
@@ -73,7 +67,13 @@ set(
 )
 
 include(GNUInstallDirs)
-include(folly-deps) # Find the required packages
+
+set(CMAKE_THREAD_PREFER_PTHREAD ON)
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+set(FOLLY_HAVE_PTHREAD "${CMAKE_USE_PTHREADS_INIT}")
+list(APPEND CMAKE_REQUIRED_LIBRARIES Threads::Threads)
+list(APPEND FOLLY_LINK_LIBRARIES Threads::Threads)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
   include(FollyCompilerMSVC)
@@ -82,6 +82,7 @@ else()
 endif()
 include(FollyFunctions)
 
+include(folly-deps) # Find the required packages
 include(FollyConfigChecks)
 configure_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/CMake/folly-config.h.cmake
@@ -103,8 +104,7 @@ REMOVE_MATCHES_FROM_LISTS(files hfiles
   MATCHES
     "^${FOLLY_DIR}/build/"
     "^${FOLLY_DIR}/experimental/exception_tracer/"
-    "^${FOLLY_DIR}/experimental/hazptr/bench/"
-    "^${FOLLY_DIR}/experimental/hazptr/example/"
+    "^${FOLLY_DIR}/experimental/pushmi/"
     "^${FOLLY_DIR}/futures/exercises/"
     "^${FOLLY_DIR}/logging/example/"
     "^${FOLLY_DIR}/(.*/)?test/"
@@ -117,10 +117,9 @@ list(REMOVE_ITEM files
   ${FOLLY_DIR}/experimental/io/HugePageUtil.cpp
   ${FOLLY_DIR}/python/fibers.cpp
   ${FOLLY_DIR}/python/GILAwareManualExecutor.cpp
+  ${FOLLY_DIR}/cybld/folly/executor.cpp
 )
 list(REMOVE_ITEM hfiles
-  ${FOLLY_DIR}/detail/SlowFingerprint.h
-  ${FOLLY_DIR}/detail/FingerprintPolynomial.h
   ${FOLLY_DIR}/python/fibers.h
   ${FOLLY_DIR}/python/GILAwareManualExecutor.h
 )
@@ -163,15 +162,6 @@ if (NOT FOLLY_USE_SYMBOLIZER)
     ${FOLLY_DIR}/SingletonStackTrace.cpp
   )
 endif()
-if (NOT ${LIBURCU_FOUND})
-  list(REMOVE_ITEM files
-    ${FOLLY_DIR}/experimental/RCUUtils.cpp
-  )
-  list(REMOVE_ITEM hfiles
-    ${FOLLY_DIR}/experimental/RCURefCount.h
-    ${FOLLY_DIR}/experimental/RCUUtils.h
-  )
-endif()
 if (NOT ${LIBAIO_FOUND})
   list(REMOVE_ITEM files
     ${FOLLY_DIR}/experimental/io/AsyncIO.cpp
@@ -203,9 +193,6 @@ auto_source_group(folly ${FOLLY_DIR} ${files} ${hfiles})
 apply_folly_compile_options_to_target(folly_base)
 # Add the generated files to the correct source group.
 source_group("folly" FILES ${CMAKE_CURRENT_BINARY_DIR}/folly/folly-config.h)
-source_group("folly\\build" FILES
-  ${CMAKE_CURRENT_BINARY_DIR}/folly/build/FingerprintTables.cpp
-)
 
 # Generate pkg-config variables from folly_deps before we add our own
 # build/install-time include directory generator expressions
@@ -213,9 +200,13 @@ include(GenPkgConfig)
 gen_pkgconfig_vars(FOLLY_PKGCONFIG folly_deps)
 
 target_include_directories(folly_deps
+  BEFORE
   INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>
+)
+target_include_directories(folly_deps
+  INTERFACE
     $<INSTALL_INTERFACE:include>
 )
 
@@ -228,64 +219,43 @@ target_compile_definitions(folly_base
     $<TARGET_PROPERTY:folly_deps,INTERFACE_COMPILE_DEFINITIONS>
 )
 
-# Now to generate the fingerprint tables
-add_executable(GenerateFingerprintTables
-  ${FOLLY_DIR}/build/GenerateFingerprintTables.cpp
-  $<TARGET_OBJECTS:folly_base>
-)
-target_link_libraries(GenerateFingerprintTables PRIVATE folly_deps)
-apply_folly_compile_options_to_target(GenerateFingerprintTables)
-set_property(TARGET GenerateFingerprintTables PROPERTY FOLDER "Build")
-source_group("" FILES ${FOLLY_DIR}/build/GenerateFingerprintTables.cpp)
+set(FOLLY_INSTALL_TARGETS folly folly_deps)
 
-# Compile the fingerprint tables.
-add_custom_command(
-  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/folly/build/FingerprintTables.cpp
-  COMMAND
-    ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/folly/build
-  COMMAND
-    GenerateFingerprintTables
-    --install_dir ${CMAKE_CURRENT_BINARY_DIR}/folly/build
-  DEPENDS GenerateFingerprintTables
-  COMMENT "Generating the fingerprint tables..."
-)
-add_library(folly_fingerprint STATIC
-  ${CMAKE_CURRENT_BINARY_DIR}/folly/build/FingerprintTables.cpp
-  ${FOLLY_DIR}/Fingerprint.h
-  ${FOLLY_DIR}/detail/SlowFingerprint.h
-  ${FOLLY_DIR}/detail/FingerprintPolynomial.h
-  $<TARGET_OBJECTS:folly_base>
-)
-target_link_libraries(folly_fingerprint PRIVATE folly_deps)
-apply_folly_compile_options_to_target(folly_fingerprint)
+option(PYTHON_EXTENSIONS "Build Python Bindings for Folly, requires Cython" OFF)
+if (PYTHON_EXTENSIONS)
+  # Compile folly such that it can be linked in to a shared library
+  # required for linking to python extensions
+  add_library(folly_pic
+    $<TARGET_PROPERTY:folly_base,SOURCES>
+  )
+  apply_folly_compile_options_to_target(folly_pic)
+  target_include_directories(folly_pic
+    PUBLIC
+      $<TARGET_PROPERTY:folly_deps,INTERFACE_INCLUDE_DIRECTORIES>
+  )
+  target_compile_definitions(folly_pic
+    PUBLIC
+      $<TARGET_PROPERTY:folly_deps,INTERFACE_COMPILE_DEFINITIONS>
+  )
+  set_target_properties(folly_pic PROPERTIES POSITION_INDEPENDENT_CODE True)
+  list(APPEND FOLLY_INSTALL_TARGETS folly_pic)
+endif ()
 
-# We want to generate a single library and target for folly, but we needed a
-# two-stage compile for the fingerprint tables, so we create a phony source
-# file that we modify whenever the base libraries change, causing folly to be
-# re-linked, making things happy.
-add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/folly_dep.cpp
-  COMMAND ${CMAKE_COMMAND} -E touch ${CMAKE_CURRENT_BINARY_DIR}/folly_dep.cpp
-  DEPENDS folly_base folly_fingerprint
-)
 add_library(folly
-  ${CMAKE_CURRENT_BINARY_DIR}/folly_dep.cpp
   $<TARGET_OBJECTS:folly_base>
 )
 apply_folly_compile_options_to_target(folly)
-source_group("" FILES ${CMAKE_CURRENT_BINARY_DIR}/folly_dep.cpp)
 
 target_link_libraries(folly PUBLIC folly_deps)
 
-install(TARGETS folly folly_deps
+
+install(TARGETS ${FOLLY_INSTALL_TARGETS}
   EXPORT folly
   RUNTIME DESTINATION bin
   LIBRARY DESTINATION ${LIB_INSTALL_DIR}
   ARCHIVE DESTINATION ${LIB_INSTALL_DIR})
 auto_install_files(folly ${FOLLY_DIR}
   ${hfiles}
-  ${FOLLY_DIR}/Fingerprint.h
-  ${FOLLY_DIR}/detail/SlowFingerprint.h
-  ${FOLLY_DIR}/detail/FingerprintPolynomial.h
 )
 install(
   FILES ${CMAKE_CURRENT_BINARY_DIR}/folly/folly-config.h
@@ -361,11 +331,13 @@ if (BUILD_TESTS)
 
   add_library(folly_test_support
     ${FOLLY_DIR}/test/common/TestMain.cpp
+    ${FOLLY_DIR}/test/FBVectorTestUtil.cpp
     ${FOLLY_DIR}/test/DeterministicSchedule.cpp
     ${FOLLY_DIR}/test/DeterministicSchedule.h
     ${FOLLY_DIR}/test/SingletonTestStructs.cpp
     ${FOLLY_DIR}/test/SocketAddressTestHelper.cpp
     ${FOLLY_DIR}/test/SocketAddressTestHelper.h
+    ${FOLLY_DIR}/experimental/test/CodingTestUtils.cpp
     ${FOLLY_DIR}/logging/test/ConfigHelpers.cpp
     ${FOLLY_DIR}/logging/test/ConfigHelpers.h
     ${FOLLY_DIR}/logging/test/TestLogHandler.cpp
@@ -486,6 +458,9 @@ if (BUILD_TESTS)
       #TEST async_io_test SOURCES AsyncIOTest.cpp
       TEST fs_util_test SOURCES FsUtilTest.cpp
 
+    DIRECTORY external/farmhash/test/
+      TEST farmhash_test SOURCES farmhash_test.cpp
+
     DIRECTORY logging/test/
       TEST async_file_writer_test SOURCES AsyncFileWriterTest.cpp
       TEST config_parser_test SOURCES ConfigParserTest.cpp
@@ -568,6 +543,7 @@ if (BUILD_TESTS)
 
     DIRECTORY hash/test/
       TEST checksum_test SOURCES ChecksumTest.cpp
+      TEST farm_hash_test SOURCES FarmHashTest.cpp
       TEST hash_test WINDOWS_DISABLED
         SOURCES HashTest.cpp
       TEST spooky_hash_v1_test SOURCES SpookyHashV1Test.cpp
@@ -638,10 +614,14 @@ if (BUILD_TESTS)
         SOURCES ThreadCachedArenaTest.cpp
       TEST mallctl_helper_test SOURCES MallctlHelperTest.cpp
 
+    DIRECTORY net/detail/test/
+      TEST socket_file_descriptor_map_test SOURCES SocketFileDescriptorMapTest.cpp
+
     DIRECTORY portability/test/
       TEST constexpr_test SOURCES ConstexprTest.cpp
       TEST libgen-test SOURCES LibgenTest.cpp
       TEST openssl_portability_test SOURCES OpenSSLPortabilityTest.cpp
+      TEST pthread_test SOURCES PThreadTest.cpp
       TEST time-test SOURCES TimeTest.cpp
 
     DIRECTORY ssl/test/
@@ -673,6 +653,7 @@ if (BUILD_TESTS)
     DIRECTORY synchronization/test/
       TEST atomic_struct_test SOURCES AtomicStructTest.cpp
       TEST small_locks_test SOURCES SmallLocksTest.cpp
+      TEST atomic_util_test SOURCES AtomicUtilTest.cpp
 
     DIRECTORY test/
       TEST ahm_int_stress_test SOURCES AHMIntStressTest.cpp
@@ -705,8 +686,7 @@ if (BUILD_TESTS)
       #TEST file_lock_test SOURCES FileLockTest.cpp
       TEST file_util_test HANGING
         SOURCES FileUtilTest.cpp
-      # Linux is apparently unhappy about this.. Should probably figure out why.
-      #TEST fingerprint_test SOURCES FingerprintTest.cpp
+      TEST fingerprint_test SOURCES FingerprintTest.cpp
       TEST format_other_test SOURCES FormatOtherTest.cpp
       TEST format_test SOURCES FormatTest.cpp
       TEST function_test BROKEN
@@ -724,6 +704,7 @@ if (BUILD_TESTS)
       # MSVC Preprocessor stringizing raw string literals bug
       #TEST json_test SOURCES JsonTest.cpp
       TEST json_pointer_test SOURCES json_pointer_test.cpp
+      TEST json_patch_test SOURCES json_patch_test.cpp
       TEST json_other_test
         CONTENT_DIR json_test_data/
         SOURCES
@@ -762,7 +743,6 @@ if (BUILD_TESTS)
       # SingletonTest requires Subprocess
       #TEST singleton_test SOURCES SingletonTest.cpp
       TEST singleton_test_global SOURCES SingletonTestGlobal.cpp
-      TEST singleton_thread_local_test SOURCES SingletonThreadLocalTest.cpp
       TEST small_vector_test WINDOWS_DISABLED
         SOURCES small_vector_test.cpp
       TEST sorted_vector_types_test SOURCES sorted_vector_test.cpp
@@ -779,6 +759,18 @@ if (BUILD_TESTS)
       TEST uri_test SOURCES UriTest.cpp
       TEST varint_test SOURCES VarintTest.cpp
   )
+
+  get_target_property(pic folly POSITION_INDEPENDENT_CODE)
+  if (pic)
+    add_library(singleton_thread_local_overload
+      SHARED ${FOLLY_DIR}/test/SingletonThreadLocalTestOverload.cpp)
+    apply_folly_compile_options_to_target(singleton_thread_local_overload)
+    set_target_properties(singleton_thread_local_overload PROPERTIES PREFIX "")
+    target_link_libraries(singleton_thread_local_overload PRIVATE folly)
+    folly_define_tests(
+      DIRECTORY test/
+        TEST singleton_thread_local_test SOURCES SingletonThreadLocalTest.cpp)
+  endif()
 endif()
 
 add_subdirectory(folly)

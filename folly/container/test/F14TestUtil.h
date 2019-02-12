@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <ostream>
@@ -279,7 +280,7 @@ struct Tracked {
 
 template <int Tag>
 struct TransparentTrackedHash {
-  using is_transparent = std::true_type;
+  using is_transparent = void;
 
   size_t operator()(Tracked<Tag> const& tracked) const {
     return tracked.val_ ^ Tag;
@@ -291,7 +292,7 @@ struct TransparentTrackedHash {
 
 template <int Tag>
 struct TransparentTrackedEqual {
-  using is_transparent = std::true_type;
+  using is_transparent = void;
 
   uint64_t unwrap(Tracked<Tag> const& v) const {
     return v.val_;
@@ -394,12 +395,21 @@ class SwapTrackingAlloc {
     ++testAllocationCount;
     testAllocatedMemorySize += n * sizeof(T);
     ++testAllocatedBlockCount;
-    return a_.allocate(n);
+    std::size_t extra =
+        std::max<std::size_t>(1, sizeof(std::size_t) / sizeof(T));
+    T* p = a_.allocate(extra + n);
+    std::memcpy(p, &n, sizeof(std::size_t));
+    return p + extra;
   }
   void deallocate(T* p, size_t n) {
     testAllocatedMemorySize -= n * sizeof(T);
     --testAllocatedBlockCount;
-    a_.deallocate(p, n);
+    std::size_t extra =
+        std::max<std::size_t>(1, sizeof(std::size_t) / sizeof(T));
+    std::size_t check;
+    std::memcpy(&check, p - extra, sizeof(std::size_t));
+    FOLLY_SAFE_CHECK(check == n, "");
+    a_.deallocate(p - extra, n + extra);
   }
 
  private:

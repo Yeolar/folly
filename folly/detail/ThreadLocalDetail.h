@@ -356,6 +356,8 @@ struct StaticMetaBase {
 
   FOLLY_EXPORT static ThreadEntryList* getThreadEntryList();
 
+  static bool dying();
+
   static void onThreadExit(void* ptr);
 
   // returns the elementsCapacity for the
@@ -428,30 +430,27 @@ struct StaticMeta final : StaticMetaBase {
   static StaticMeta<Tag, AccessMode>& instance() {
     // Leak it on exit, there's only one per process and we don't have to
     // worry about synchronization with exiting threads.
-    /* library-local */ static auto instance =
-        detail::createGlobal<StaticMeta<Tag, AccessMode>, void>();
-    return *instance;
+    return detail::createGlobal<StaticMeta<Tag, AccessMode>, void>();
   }
 
-  FOLLY_ALWAYS_INLINE static ElementWrapper& get(EntryID* ent) {
+  FOLLY_EXPORT FOLLY_ALWAYS_INLINE static ElementWrapper& get(EntryID* ent) {
+    // Eliminate as many branches and as much extra code as possible in the
+    // cached fast path, leaving only one branch here and one indirection below.
     uint32_t id = ent->getOrInvalid();
 #ifdef FOLLY_TLD_USE_FOLLY_TLS
     static FOLLY_TLS ThreadEntry* threadEntry{};
     static FOLLY_TLS size_t capacity{};
-    // Eliminate as many branches and as much extra code as possible in the
-    // cached fast path, leaving only one branch here and one indirection below.
-    if (UNLIKELY(capacity <= id)) {
-      getSlowReserveAndCache(ent, id, threadEntry, capacity);
-    }
 #else
     ThreadEntry* threadEntry{};
     size_t capacity{};
-    getSlowReserveAndCache(ent, id, threadEntry, capacity);
 #endif
+    if (FOLLY_UNLIKELY(capacity <= id)) {
+      getSlowReserveAndCache(ent, id, threadEntry, capacity);
+    }
     return threadEntry->elements[id];
   }
 
-  static void getSlowReserveAndCache(
+  FOLLY_NOINLINE static void getSlowReserveAndCache(
       EntryID* ent,
       uint32_t& id,
       ThreadEntry*& threadEntry,

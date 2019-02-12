@@ -44,7 +44,9 @@ enum class State : uint8_t {
   Start = 1 << 0,
   OnlyResult = 1 << 1,
   OnlyCallback = 1 << 2,
-  Done = 1 << 3,
+  Proxy = 1 << 3,
+  Done = 1 << 4,
+  Empty = 1 << 5,
 };
 constexpr State operator&(State a, State b) {
   return State(uint8_t(a) & uint8_t(b));
@@ -112,17 +114,25 @@ static_assert(sizeof(SpinLock) == 1, "missized");
 /// The FSM to manage the primary producer-to-consumer info-flow has these
 ///   allowed (atomic) transitions:
 ///
-///   +-------------------------------------------------------------+
-///   |                    ---> OnlyResult -----                    |
-///   |                  /                       \                  |
-///   |               (setResult())             (setCallback())     |
-///   |                /                           \                |
-///   |   Start ----->                               ------> Done   |
-///   |                \                           /                |
-///   |               (setCallback())           (setResult())       |
-///   |                  \                       /                  |
-///   |                    ---> OnlyCallback ---                    |
-///   +-------------------------------------------------------------+
+///   +----------------------------------------------------------------+
+///   |                       ---> OnlyResult -----                    |
+///   |                     /                       \                  |
+///   |                  (setResult())             (setCallback())     |
+///   |                   /                           \                |
+///   |   Start --------->                              ------> Done   |
+///   |     \             \                           /                |
+///   |      \           (setCallback())           (setResult())       |
+///   |       \             \                       /                  |
+///   |        \              ---> OnlyCallback ---                    |
+///   |         \                                   \                  |
+///   |     (setProxy())                           (setProxy())        |
+///   |           \                                   \                |
+///   |            \                                    ------> Empty  |
+///   |             \                                 /                |
+///   |              \                             (setCallback())     |
+///   |               \                             /                  |
+///   |                 ---------> Proxy ----------                    |
+///   +----------------------------------------------------------------+
 ///
 /// States and the corresponding producer-to-consumer data status & ownership:
 ///
@@ -141,12 +151,15 @@ static_assert(sizeof(SpinLock) == 1, "missized");
 ///   point forward only the producer thread can safely access that callback
 ///   (see `setResult()` and `doCallback()` where the producer thread can both
 ///   read and modify the callback).
+/// - Proxy: producer thread has set a proxy core which the callback should be
+///   proxied to.
 /// - Done: callback can be safely accessed only within `doCallback()`, which
 ///   gets called on exactly one thread exactly once just after the transition
 ///   to Done. The future object will have determined whether that callback
 ///   has/will move-out the result, but either way the result remains logically
 ///   owned exclusively by the consumer thread (the code of Future/SemiFuture,
 ///   of the continuation, and/or of callers of `future.result()`, etc.).
+/// - Empty: the core successfully proxied the callback and is now empty.
 ///
 /// Start state:
 ///
@@ -161,6 +174,8 @@ static_assert(sizeof(SpinLock) == 1, "missized");
 ///   `future.wait()` and/or `future.get()` are used.
 /// - Done: a terminal state when `future.then()` is used, and sometimes also
 ///   when `future.wait()` and/or `future.get()` are used.
+/// - Proxy: a terminal state if proxy core was set, but callback was never set.
+/// - Empty: a terminal state when proxying a callback was successful.
 ///
 /// Notes and caveats:
 ///
@@ -183,6 +198,9 @@ class Core final {
       "void futures are not supported. Use Unit instead.");
 
  public:
+  using Result = Try<T>;
+  using Callback = folly::Function<void(Result&&)>;
+
   /// State will be Start
   static Core* make() {
     return new Core();
@@ -223,7 +241,12 @@ class Core final {
   /// Identical to `this->ready()`
   bool hasResult() const noexcept {
     constexpr auto allowed = State::OnlyResult | State::Done;
-    auto const state = state_.load(std::memory_order_acquire);
+    auto core = this;
+    auto state = core->state_.load(std::memory_order_acquire);
+    while (state == State::Proxy) {
+      core = core->proxy_;
+      state = core->state_.load(std::memory_order_acquire);
+    }
     return State() != (state & allowed);
   }
 
@@ -256,11 +279,19 @@ class Core final {
   ///   all callbacks modify (possibly move-out) the result.)
   Try<T>& getTry() {
     DCHECK(hasResult());
-    return result_;
+    auto core = this;
+    while (core->state_.load(std::memory_order_relaxed) == State::Proxy) {
+      core = core->proxy_;
+    }
+    return core->result_;
   }
   Try<T> const& getTry() const {
     DCHECK(hasResult());
-    return result_;
+    auto core = this;
+    while (core->state_.load(std::memory_order_relaxed) == State::Proxy) {
+      core = core->proxy_;
+    }
+    return core->result_;
   }
 
   /// Call only from consumer thread.
@@ -272,36 +303,66 @@ class Core final {
   /// and might also synchronously execute that callback (e.g., if there is no
   /// executor or if the executor is inline).
   template <typename F>
-  void setCallback(F&& func) {
+  void setCallback(F&& func, std::shared_ptr<folly::RequestContext> context) {
     DCHECK(!hasCallback());
 
     // construct callback_ first; if that fails, context_ will not leak
     ::new (&callback_) Callback(std::forward<F>(func));
-    ::new (&context_) Context(RequestContext::saveContext());
+    ::new (&context_) Context(std::move(context));
 
     auto state = state_.load(std::memory_order_acquire);
-    while (true) {
-      switch (state) {
-        case State::Start:
-          if (state_.compare_exchange_strong(
-                  state, State::OnlyCallback, std::memory_order_release)) {
-            return;
-          }
-          assume(state == State::OnlyResult);
-          FOLLY_FALLTHROUGH;
 
-        case State::OnlyResult:
-          if (state_.compare_exchange_strong(
-                  state, State::Done, std::memory_order_release)) {
-            doCallback();
-            return;
-          }
-          FOLLY_FALLTHROUGH;
-
-        default:
-          terminate_with<std::logic_error>("setCallback unexpected state");
+    if (state == State::Start) {
+      if (state_.compare_exchange_strong(
+              state, State::OnlyCallback, std::memory_order_release)) {
+        return;
       }
+      assume(state == State::OnlyResult || state == State::Proxy);
     }
+
+    if (state == State::OnlyResult) {
+      state_.store(State::Done, std::memory_order_relaxed);
+      doCallback();
+      return;
+    }
+
+    if (state == State::Proxy) {
+      return proxyCallback();
+    }
+
+    terminate_with<std::logic_error>("setCallback unexpected state");
+  }
+
+  /// Call only from producer thread.
+  /// Call only once - else undefined behavior.
+  ///
+  /// See FSM graph for allowed transitions.
+  ///
+  /// This can not be called concurrently with setResult().
+  void setProxy(Core* proxy) {
+    DCHECK(!hasResult());
+
+    proxy_ = proxy;
+
+    auto state = state_.load(std::memory_order_acquire);
+    switch (state) {
+      case State::Start:
+        if (state_.compare_exchange_strong(
+                state, State::Proxy, std::memory_order_release)) {
+          break;
+        }
+        assume(state == State::OnlyCallback);
+        FOLLY_FALLTHROUGH;
+
+      case State::OnlyCallback:
+        proxyCallback();
+        break;
+
+      default:
+        terminate_with<std::logic_error>("setCallback unexpected state");
+    }
+
+    detachOne();
   }
 
   /// Call only from producer thread.
@@ -451,8 +512,25 @@ class Core final {
 
   ~Core() {
     DCHECK(attached_ == 0);
-    DCHECK(hasResult());
-    result_.~Result();
+    auto state = state_.load(std::memory_order_relaxed);
+    switch (state) {
+      case State::OnlyResult:
+        FOLLY_FALLTHROUGH;
+
+      case State::Done:
+        result_.~Result();
+        break;
+
+      case State::Proxy:
+        proxy_->detachFuture();
+        break;
+
+      case State::Empty:
+        break;
+
+      default:
+        terminate_with<std::logic_error>("~Core unexpected state");
+    }
   }
 
   // Helper class that stores a pointer to the `Core` object and calls
@@ -552,6 +630,15 @@ class Core final {
     }
   }
 
+  void proxyCallback() {
+    state_.store(State::Empty, std::memory_order_relaxed);
+    proxy_->setExecutor(std::move(executor_), priority_);
+    proxy_->setCallback(std::move(callback_), std::move(context_));
+    proxy_->detachFuture();
+    context_.~Context();
+    callback_.~Callback();
+  }
+
   void detachOne() noexcept {
     auto a = attached_.fetch_sub(1, std::memory_order_acq_rel);
     assert(a >= 1);
@@ -569,8 +656,6 @@ class Core final {
     }
   }
 
-  using Result = Try<T>;
-  using Callback = folly::Function<void(Result&&)>;
   using Context = std::shared_ptr<RequestContext>;
 
   union {
@@ -580,6 +665,7 @@ class Core final {
   // contained entirely in one cache line
   union {
     Result result_;
+    Core* proxy_;
   };
   std::atomic<State> state_;
   std::atomic<unsigned char> attached_;

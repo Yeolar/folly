@@ -223,6 +223,26 @@ TEST(Traits, actuallyRelocatable) {
   testIsRelocatable<std::vector<char>>(5, 'g');
 }
 
+struct inspects_tag {
+  template <typename T>
+  std::false_type is_char(tag_t<T>) const {
+    return {};
+  }
+  std::true_type is_char(tag_t<char>) const {
+    return {};
+  }
+};
+
+TEST(Traits, tag) {
+  inspects_tag f;
+  EXPECT_FALSE(f.is_char(tag_t<int>{}));
+  EXPECT_TRUE(f.is_char(tag_t<char>{}));
+#if __cplusplus >= 201703L
+  EXPECT_FALSE(f.is_char(tag<int>));
+  EXPECT_TRUE(f.is_char(tag<char>));
+#endif
+}
+
 namespace {
 // has_value_type<T>::value is true if T has a nested type `value_type`
 template <class T, class = void>
@@ -266,6 +286,18 @@ TEST(Traits, type_t) {
   EXPECT_FALSE(
       (::std::is_constructible<::container<std::string>, some_tag, float>::
            value));
+}
+
+TEST(Traits, aligned_storage_for_t) {
+  struct alignas(2) Foo {
+    char data[4];
+  };
+  using storage = aligned_storage_for_t<Foo[4]>;
+  EXPECT_EQ(16, sizeof(storage));
+  EXPECT_EQ(2, alignof(storage));
+  EXPECT_TRUE(std::is_trivial<storage>::value);
+  EXPECT_TRUE(std::is_standard_layout<storage>::value);
+  EXPECT_TRUE(std::is_pod<storage>::value); // pod = trivial + standard-layout
 }
 
 TEST(Traits, remove_cvref) {

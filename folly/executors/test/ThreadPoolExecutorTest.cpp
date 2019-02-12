@@ -572,16 +572,20 @@ TEST(ThreadPoolExecutorTest, RequestContext) {
   });
 }
 
+std::atomic<int> g_sequence{};
+
 struct SlowMover {
   explicit SlowMover(bool slow_ = false) : slow(slow_) {}
   SlowMover(SlowMover&& other) noexcept {
     *this = std::move(other);
   }
   SlowMover& operator=(SlowMover&& other) noexcept {
+    ++g_sequence;
     slow = other.slow;
     if (slow) {
       /* sleep override */ std::this_thread::sleep_for(milliseconds(50));
     }
+    ++g_sequence;
     return *this;
   }
 
@@ -639,6 +643,44 @@ TEST(ThreadPoolExecutorTest, UnboundedBlockingQueueBugD3527722) {
   bugD3527722_test<UBQ<SlowMover>>();
 }
 
+template <typename Q>
+void nothrow_not_full_test() {
+  /* LifoSemMPMCQueue should not throw when not full when active
+     consumers are delayed. */
+  Q q(2);
+  g_sequence = 0;
+
+  std::thread consumer1([&] {
+    while (g_sequence < 4) {
+      ;
+    }
+    q.take(); // ++g_sequence to 5 then slow
+  });
+  std::thread consumer2([&] {
+    while (g_sequence < 5) {
+      ;
+    }
+    q.take(); // ++g_sequence to 6 and 7 - fast
+  });
+
+  std::thread producer([&] {
+    q.add(SlowMover(true)); // ++g_sequence to 1 and 2
+    q.add(SlowMover(false)); // ++g_sequence to 3 and 4
+    while (g_sequence < 7) { // g_sequence == 7 implies queue is not full
+      ;
+    }
+    EXPECT_NO_THROW(q.add(SlowMover(false)));
+  });
+
+  producer.join();
+  consumer1.join();
+  consumer2.join();
+}
+
+TEST(ThreadPoolExecutorTest, LifoSemMPMCQueueNoThrowNotFull) {
+  nothrow_not_full_test<LifoSemMPMCQueue<SlowMover>>();
+}
+
 template <typename TPE>
 static void removeThreadTest() {
   // test that adding a .then() after we have removed some threads
@@ -648,11 +690,11 @@ static void removeThreadTest() {
   TPE fe(2);
   f = folly::makeFuture()
           .via(&fe)
-          .then([&id1]() {
+          .thenValue([&id1](auto&&) {
             burnMs(100)();
             id1 = std::this_thread::get_id();
           })
-          .then([&id2]() {
+          .thenValue([&id2](auto&&) {
             return 77;
             id2 = std::this_thread::get_id();
           });
@@ -708,11 +750,11 @@ template <typename TPE>
 void keepAliveTest() {
   auto executor = std::make_unique<TPE>(4);
 
-  auto f =
-      futures::sleep(std::chrono::milliseconds{100})
-          .via(executor.get())
-          .then([keepAlive = getKeepAliveToken(executor.get())] { return 42; })
-          .semi();
+  auto f = futures::sleep(std::chrono::milliseconds{100})
+               .via(executor.get())
+               .thenValue([keepAlive = getKeepAliveToken(executor.get())](
+                              auto&&) { return 42; })
+               .semi();
 
   executor.reset();
 
@@ -831,11 +873,11 @@ static void WeakRefTest() {
     TPE fe(1);
     f = folly::makeFuture()
             .via(&fe)
-            .then([]() { burnMs(100)(); })
-            .then([&] { ++counter; })
+            .thenValue([](auto&&) { burnMs(100)(); })
+            .thenValue([&](auto&&) { ++counter; })
             .via(fe.weakRef())
-            .then([]() { burnMs(100)(); })
-            .then([&] { ++counter; });
+            .thenValue([](auto&&) { burnMs(100)(); })
+            .thenValue([&](auto&&) { ++counter; });
   }
   EXPECT_THROW(std::move(*f).get(), folly::BrokenPromise);
   EXPECT_EQ(1, counter);
@@ -853,12 +895,12 @@ static void virtualExecutorTest() {
       VirtualExecutor ve(fe);
       f = futures::sleep(100ms)
               .via(&ve)
-              .then([&] {
+              .thenValue([&](auto&&) {
                 ++counter;
                 return futures::sleep(100ms);
               })
               .via(&fe)
-              .then([&] { ++counter; })
+              .thenValue([&](auto&&) { ++counter; })
               .semi();
     }
     EXPECT_EQ(1, counter);

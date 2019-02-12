@@ -60,20 +60,13 @@ class ThreadLocal {
  public:
   constexpr ThreadLocal() : constructor_([]() { return new T(); }) {}
 
-  template <
-      typename F,
-      _t<std::enable_if<is_invocable_r<T*, F>::value, int>> = 0>
+  template <typename F, std::enable_if_t<is_invocable_r<T*, F>::value, int> = 0>
   explicit ThreadLocal(F&& constructor)
       : constructor_(std::forward<F>(constructor)) {}
 
-  T* get() const {
-    T* const ptr = tlp_.get();
-    if (LIKELY(ptr != nullptr)) {
-      return ptr;
-    }
-
-    // separated new item creation out to speed up the fast path.
-    return makeTlp();
+  FOLLY_ALWAYS_INLINE FOLLY_ATTR_VISIBILITY_HIDDEN T* get() const {
+    auto const ptr = tlp_.get();
+    return FOLLY_LIKELY(!!ptr) ? ptr : makeTlp();
   }
 
   T* operator->() const {
@@ -102,7 +95,7 @@ class ThreadLocal {
   ThreadLocal(const ThreadLocal&) = delete;
   ThreadLocal& operator=(const ThreadLocal&) = delete;
 
-  T* makeTlp() const {
+  FOLLY_NOINLINE T* makeTlp() const {
     auto const ptr = constructor_();
     tlp_.reset(ptr);
     return ptr;

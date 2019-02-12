@@ -1458,11 +1458,12 @@ class BasicFixedString : private detail::fixedstring::FixedStringBase {
       std::size_t pos,
       std::size_t count = npos) noexcept(false) {
     using A = const Char[1];
+    constexpr A a{Char(0)};
     return replace(
         pos,
         detail::fixedstring::checkOverflowOrNpos(
             count, size_ - detail::fixedstring::checkOverflow(pos, size_)),
-        A{Char(0)},
+        a,
         0u);
   }
 
@@ -3011,7 +3012,7 @@ inline namespace {
 constexpr const std::size_t& npos = detail::fixedstring::FixedStringBase::npos;
 } // namespace
 
-#if defined(__GNUC__)
+#if defined(__GNUC__) && !defined(__ICC)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpragmas"
 #pragma GCC diagnostic ignored "-Wgnu-string-literal-operator-template"

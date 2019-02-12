@@ -76,6 +76,8 @@ class AsyncUDPServerSocket : private AsyncUDPSocket::ReadCallback,
     virtual ~Callback() = default;
   };
 
+  enum class DispatchMechanism { RoundRobin, ClientAddressHash };
+
   /**
    * Create a new UDP server socket
    *
@@ -83,8 +85,11 @@ class AsyncUDPServerSocket : private AsyncUDPSocket::ReadCallback,
    * If packet are larger than this value, as per UDP protocol, remaining data
    * is dropped and you get `truncated = true` in onDataAvailable callback
    */
-  explicit AsyncUDPServerSocket(EventBase* evb, size_t sz = 1500)
-      : evb_(evb), packetSize_(sz), nextListener_(0) {}
+  explicit AsyncUDPServerSocket(
+      EventBase* evb,
+      size_t sz = 1500,
+      DispatchMechanism dm = DispatchMechanism::RoundRobin)
+      : evb_(evb), packetSize_(sz), dispatchMechanism_(dm), nextListener_(0) {}
 
   ~AsyncUDPServerSocket() override {
     if (socket_) {
@@ -97,11 +102,16 @@ class AsyncUDPServerSocket : private AsyncUDPSocket::ReadCallback,
 
     socket_ = std::make_shared<AsyncUDPSocket>(evb_);
     socket_->setReusePort(reusePort_);
+    socket_->setReuseAddr(reuseAddr_);
     socket_->bind(addy);
   }
 
   void setReusePort(bool reusePort) {
     reusePort_ = reusePort;
+  }
+
+  void setReuseAddr(bool reuseAddr) {
+    reuseAddr_ = reuseAddr;
   }
 
   folly::SocketAddress address() const {
@@ -193,12 +203,30 @@ class AsyncUDPServerSocket : private AsyncUDPSocket::ReadCallback,
       return;
     }
 
-    if (nextListener_ >= listeners_.size()) {
-      nextListener_ = 0;
+    uint32_t listenerId = 0;
+    uint64_t client_hash_lo = 0;
+    switch (dispatchMechanism_) {
+      case DispatchMechanism::ClientAddressHash:
+        // Hash base on clientAddress.
+        // 1. This logic is samilar to: clientAddress.hash() % listeners_.size()
+        //    But runs faster as it use multiply and shift instead of division.
+        // 2. Only use the lower 32 bit from the address hash result for faster
+        //    computation.
+        client_hash_lo = static_cast<uint32_t>(clientAddress.hash());
+        listenerId = (client_hash_lo * listeners_.size()) >> 32;
+        break;
+      case DispatchMechanism::RoundRobin: // round robin is default.
+      default:
+        if (nextListener_ >= listeners_.size()) {
+          nextListener_ = 0;
+        }
+        listenerId = nextListener_;
+        ++nextListener_;
+        break;
     }
 
     auto client = clientAddress;
-    auto callback = listeners_[nextListener_].second;
+    auto callback = listeners_[listenerId].second;
     auto socket = socket_;
 
     // Schedule it in the listener's eventbase
@@ -211,8 +239,7 @@ class AsyncUDPServerSocket : private AsyncUDPSocket::ReadCallback,
       callback->onDataAvailable(socket, client, std::move(data), truncated);
     };
 
-    listeners_[nextListener_].first->runInEventBaseThread(std::move(f));
-    ++nextListener_;
+    listeners_[listenerId].first->runInEventBaseThread(std::move(f));
   }
 
   void onReadError(const AsyncSocketException& ex) noexcept override {
@@ -240,6 +267,8 @@ class AsyncUDPServerSocket : private AsyncUDPSocket::ReadCallback,
   typedef std::pair<EventBase*, Callback*> Listener;
   std::vector<Listener> listeners_;
 
+  DispatchMechanism dispatchMechanism_;
+
   // Next listener to send packet to
   uint32_t nextListener_;
 
@@ -247,6 +276,7 @@ class AsyncUDPServerSocket : private AsyncUDPSocket::ReadCallback,
   folly::IOBufQueue buf_;
 
   bool reusePort_{false};
+  bool reuseAddr_{false};
 };
 
 } // namespace folly

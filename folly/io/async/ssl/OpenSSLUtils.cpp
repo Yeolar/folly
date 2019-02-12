@@ -23,6 +23,7 @@
 #include <folly/ScopeGuard.h>
 #include <folly/portability/Sockets.h>
 #include <folly/portability/Unistd.h>
+#include <folly/ssl/Init.h>
 
 namespace {
 #ifdef OPENSSL_IS_BORINGSSL
@@ -149,6 +150,7 @@ bool OpenSSLUtils::validatePeerCertNames(
 }
 
 static std::unordered_map<uint16_t, std::string> getOpenSSLCipherNames() {
+  folly::ssl::init();
   std::unordered_map<uint16_t, std::string> ret;
   SSL_CTX* ctx = nullptr;
   SSL* ssl = nullptr;
@@ -287,27 +289,23 @@ void* OpenSSLUtils::getBioAppData(BIO* b) {
 #endif
 }
 
-int OpenSSLUtils::getBioFd(BIO* b, int* fd) {
+NetworkSocket OpenSSLUtils::getBioFd(BIO* b) {
+  auto ret = BIO_get_fd(b, nullptr);
 #ifdef _WIN32
-  int ret = portability::sockets::socket_to_fd((SOCKET)BIO_get_fd(b, fd));
-  if (fd != nullptr) {
-    *fd = ret;
-  }
-  return ret;
+  return NetworkSocket((SOCKET)ret);
 #else
-  return BIO_get_fd(b, fd);
+  return NetworkSocket(ret);
 #endif
 }
 
-void OpenSSLUtils::setBioFd(BIO* b, int fd, int flags) {
+void OpenSSLUtils::setBioFd(BIO* b, NetworkSocket fd, int flags) {
 #ifdef _WIN32
-  SOCKET socket = portability::sockets::fd_to_socket(fd);
   // Internally OpenSSL uses this as an int for reasons completely
   // beyond any form of sanity, so we do the cast ourselves to avoid
   // the warnings that would be generated.
-  int sock = int(socket);
+  int sock = int(fd.data);
 #else
-  int sock = fd;
+  int sock = fd.toFd();
 #endif
   BIO_set_fd(b, sock, flags);
 }

@@ -322,6 +322,9 @@ struct SingletonHolder : public SingletonHolderBase {
   void destroyInstance() override;
 
  private:
+  template <typename Tag, typename VaultTag>
+  struct Impl;
+
   SingletonHolder(TypeDescriptor type, SingletonVault& vault);
 
   enum class SingletonHolderState {
@@ -500,17 +503,7 @@ class SingletonVault {
   // tests only.
   template <typename VaultTag = detail::DefaultTag>
   static SingletonVault* singleton() {
-    /* library-local */ static auto vault =
-        detail::createGlobal<SingletonVault, VaultTag>();
-    return vault;
-  }
-
-  typedef std::string (*StackTraceGetterPtr)();
-
-  static std::atomic<StackTraceGetterPtr>& stackTraceGetter() {
-    /* library-local */ static auto stackTraceGetterPtr = detail::
-        createGlobal<std::atomic<StackTraceGetterPtr>, SingletonVault>();
-    return *stackTraceGetterPtr;
+    return &detail::createGlobal<SingletonVault, VaultTag>();
   }
 
   void setType(Type type) {
@@ -539,10 +532,17 @@ class SingletonVault {
       detail::SingletonHolderBase*,
       detail::TypeDescriptorHasher>
       SingletonMap;
-  Synchronized<SingletonMap> singletons_;
-  Synchronized<std::unordered_set<detail::SingletonHolderBase*>>
+
+  // Use SharedMutexSuppressTSAN to suppress noisy lock inversions when building
+  // with TSAN. If TSAN is not enabled, SharedMutexSuppressTSAN is equivalent
+  // to a normal SharedMutex.
+  Synchronized<SingletonMap, SharedMutexSuppressTSAN> singletons_;
+  Synchronized<
+      std::unordered_set<detail::SingletonHolderBase*>,
+      SharedMutexSuppressTSAN>
       eagerInitSingletons_;
-  Synchronized<std::vector<detail::TypeDescriptor>> creationOrder_;
+  Synchronized<std::vector<detail::TypeDescriptor>, SharedMutexSuppressTSAN>
+      creationOrder_;
 
   // Using SharedMutexReadPriority is important here, because we want to make
   // sure we don't block nested singleton creation happening concurrently with
@@ -739,8 +739,7 @@ class LeakySingleton {
   };
 
   static Entry& entryInstance() {
-    /* library-local */ static auto entry = detail::createGlobal<Entry, Tag>();
-    return *entry;
+    return detail::createGlobal<Entry, Tag>();
   }
 
   static T& instance() {

@@ -16,7 +16,11 @@
 #pragma once
 
 #include <folly/Try.h>
+#include <folly/executors/ManualExecutor.h>
+#include <folly/experimental/coro/Task.h>
 #include <folly/experimental/coro/Traits.h>
+#include <folly/experimental/coro/ViaIfAsync.h>
+#include <folly/fibers/Baton.h>
 #include <folly/synchronization/Baton.h>
 
 #include <cassert>
@@ -64,7 +68,7 @@ class BlockingWaitPromiseBase {
   }
 
  private:
-  folly::Baton<> baton_;
+  folly::fibers::Baton baton_;
 };
 
 template <typename T>
@@ -314,6 +318,23 @@ auto blockingWait(Awaitable&& awaitable)
   return static_cast<std::add_rvalue_reference_t<await_result_t<Awaitable>>>(
       detail::makeRefBlockingWaitTask(static_cast<Awaitable&&>(awaitable))
           .get());
+}
+
+template <typename T>
+T blockingWait(Task<T>&& task) {
+  folly::ManualExecutor executor;
+  Try<T> ret;
+  bool done{false};
+
+  std::move(task).scheduleOn(&executor).start([&](Try<T>&& result) {
+    ret = std::move(result);
+    done = true;
+  });
+  while (!done) {
+    executor.drive();
+  }
+
+  return std::move(ret).value();
 }
 
 } // namespace coro

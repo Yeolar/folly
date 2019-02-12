@@ -22,7 +22,7 @@ using namespace folly;
 
 TEST(SelfDestruct, then) {
   auto* p = new Promise<int>();
-  auto future = p->getFuture().then([p](int x) {
+  auto future = p->getFuture().thenValue([p](int x) {
     delete p;
     return x + 1;
   });
@@ -67,7 +67,7 @@ TEST(SelfDestruct, throwingInlineExecutor) {
   auto* p = new Promise<int>();
   auto future = p->getFuture()
                     .via(&executor)
-                    .then([p]() -> int {
+                    .thenValue([p](auto &&) -> int {
                       delete p;
                       throw ThrowingExecutorError("callback throws");
                     })

@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <ctime>
 #include <mutex>
 #include <vector>
@@ -85,9 +86,15 @@ void FatalSignalCallbackRegistry::run() {
   }
 }
 
-// Leak it so we don't have to worry about destruction order
-FatalSignalCallbackRegistry* gFatalSignalCallbackRegistry =
-    new FatalSignalCallbackRegistry;
+std::atomic<FatalSignalCallbackRegistry*> gFatalSignalCallbackRegistry{};
+
+static FatalSignalCallbackRegistry* getFatalSignalCallbackRegistry() {
+  // Leak it so we don't have to worry about destruction order
+  static FatalSignalCallbackRegistry* fatalSignalCallbackRegistry =
+      new FatalSignalCallbackRegistry();
+
+  return fatalSignalCallbackRegistry;
+}
 
 struct {
   int number;
@@ -128,7 +135,9 @@ void callPreviousSignalHandler(int signum) {
 // in our signal handler at a time.
 //
 // Leak it so we don't have to worry about destruction order
-SafeStackTracePrinter* gStackTracePrinter = new SafeStackTracePrinter();
+//
+// Initialized by installFatalSignalHandler
+SafeStackTracePrinter* gStackTracePrinter;
 
 void printDec(uint64_t val) {
   char buf[20];
@@ -414,12 +423,17 @@ void innerSignalHandler(int signum, siginfo_t* info, void* /* uctx */) {
   gStackTracePrinter->printStackTrace(true); // with symbolization
 
   // Run user callbacks
-  gFatalSignalCallbackRegistry->run();
+  auto callbacks = gFatalSignalCallbackRegistry.load(std::memory_order_acquire);
+  if (callbacks) {
+    callbacks->run();
+  }
 }
 
 void signalHandler(int signum, siginfo_t* info, void* uctx) {
+  int savedErrno = errno;
   SCOPE_EXIT {
     flush();
+    errno = savedErrno;
   };
   innerSignalHandler(signum, info, uctx);
 
@@ -431,16 +445,32 @@ void signalHandler(int signum, siginfo_t* info, void* uctx) {
 } // namespace
 
 void addFatalSignalCallback(SignalCallback cb) {
-  gFatalSignalCallbackRegistry->add(cb);
+  getFatalSignalCallbackRegistry()->add(cb);
 }
 
 void installFatalSignalCallbacks() {
-  gFatalSignalCallbackRegistry->markInstalled();
+  getFatalSignalCallbackRegistry()->markInstalled();
 }
 
 namespace {
 
 std::atomic<bool> gAlreadyInstalled;
+
+// Small sigaltstack size threshold.
+// 8931 is known to cause the signal handler to stack overflow during
+// symbolization even for a simple one-liner "kill(getpid(), SIGTERM)".
+const size_t kSmallSigAltStackSize = 8931;
+
+bool isSmallSigAltStackEnabled() {
+  stack_t ss;
+  if (sigaltstack(nullptr, &ss) != 0) {
+    return false;
+  }
+  if ((ss.ss_flags & SS_DISABLE) != 0) {
+    return false;
+  }
+  return ss.ss_size <= kSmallSigAltStackSize;
+}
 
 } // namespace
 
@@ -450,14 +480,37 @@ void installFatalSignalHandler() {
     return;
   }
 
+  // make sure gFatalSignalCallbackRegistry is created before we
+  // install the fatal signal handler
+  gFatalSignalCallbackRegistry.store(
+      getFatalSignalCallbackRegistry(), std::memory_order_release);
+
+  // If a small sigaltstack is enabled (ex. Rust stdlib might use sigaltstack
+  // to set a small stack), the default SafeStackTracePrinter would likely
+  // stack overflow. Replace it with the unsafe self-allocate printer.
+  bool useUnsafePrinter = isSmallSigAltStackEnabled();
+  if (useUnsafePrinter) {
+    gStackTracePrinter = new UnsafeSelfAllocateStackTracePrinter();
+  } else {
+    gStackTracePrinter = new SafeStackTracePrinter();
+  }
+
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
-  sigemptyset(&sa.sa_mask);
+  if (useUnsafePrinter) {
+    // The signal handler is not async-signal-safe. Block all signals to
+    // make it safer. But it's still unsafe.
+    sigfillset(&sa.sa_mask);
+  } else {
+    sigemptyset(&sa.sa_mask);
+  }
   // By default signal handlers are run on the signaled thread's stack.
   // In case of stack overflow running the SIGSEGV signal handler on
   // the same stack leads to another SIGSEGV and crashes the program.
   // Use SA_ONSTACK, so alternate stack is used (only if configured via
   // sigaltstack).
+  // Golang also requires SA_ONSTACK. See:
+  // https://golang.org/pkg/os/signal/#hdr-Go_programs_that_use_cgo_or_SWIG
   sa.sa_flags |= SA_SIGINFO | SA_ONSTACK;
   sa.sa_sigaction = &signalHandler;
 

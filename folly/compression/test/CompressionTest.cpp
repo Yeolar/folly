@@ -23,7 +23,6 @@
 #include <unordered_map>
 #include <utility>
 
-#include <boost/noncopyable.hpp>
 #include <glog/logging.h>
 
 #include <folly/Random.h>
@@ -48,8 +47,10 @@ namespace folly {
 namespace io {
 namespace test {
 
-class DataHolder : private boost::noncopyable {
+class DataHolder {
  public:
+  DataHolder(const DataHolder&) = delete;
+  DataHolder& operator=(const DataHolder&) = delete;
   uint64_t hash(size_t size) const;
   ByteRange data(size_t size) const;
 
@@ -1386,6 +1387,12 @@ TEST(CheckCompatibleTest, ZlibIsPrefix) {
 
 #if FOLLY_HAVE_LIBZSTD
 
+#if ZSTD_VERSION_NUMBER < 10308
+#define ZSTD_c_contentSizeFlag ZSTD_p_contentSizeFlag
+#define ZSTD_c_checksumFlag ZSTD_p_checksumFlag
+#define ZSTD_c_windowLog ZSTD_p_windowLog
+#endif
+
 TEST(ZstdTest, BackwardCompatible) {
   auto codec = getCodec(CodecType::ZSTD);
   {
@@ -1411,9 +1418,9 @@ TEST(ZstdTest, CustomOptions) {
   auto test = [](const DataHolder& dh, unsigned contentSizeFlag) {
     unsigned const wlog = 23;
     zstd::Options options(1);
-    options.set(ZSTD_p_contentSizeFlag, contentSizeFlag);
-    options.set(ZSTD_p_checksumFlag, 1);
-    options.set(ZSTD_p_windowLog, wlog);
+    options.set(ZSTD_c_contentSizeFlag, contentSizeFlag);
+    options.set(ZSTD_c_checksumFlag, 1);
+    options.set(ZSTD_c_windowLog, wlog);
     auto codec = zstd::getCodec(std::move(options));
     size_t const uncompressedLength = (size_t)1 << 27;
     auto const original = std::string(

@@ -20,6 +20,7 @@
 #include <type_traits>
 
 #include <folly/Optional.h>
+#include <folly/experimental/coro/Traits.h>
 #include <folly/experimental/coro/Wait.h>
 #include <folly/futures/Future.h>
 
@@ -58,28 +59,13 @@ class AwaitableReady<void> {
   void await_resume() noexcept {}
 };
 
-struct getCurrentExecutor {};
-
-struct yield {
-  bool await_ready() {
-    return false;
-  }
-
-  void await_suspend(std::experimental::coroutine_handle<> ch) {
-    ch();
-  }
-
-  void await_resume() {}
-};
-
 template <typename Awaitable>
 class TimedWaitAwaitable {
  public:
   static_assert(
       std::is_same<Awaitable, std::decay_t<Awaitable>>::value,
       "Awaitable should be decayed.");
-  using await_resume_return_type =
-      decltype((operator co_await(std::declval<Awaitable>())).await_resume());
+  using await_resume_return_type = await_result_t<Awaitable>;
 
   TimedWaitAwaitable(Awaitable&& awaitable, std::chrono::milliseconds duration)
       : awaitable_(std::move(awaitable)), duration_(duration) {}
@@ -91,8 +77,10 @@ class TimedWaitAwaitable {
   bool await_suspend(std::experimental::coroutine_handle<> ch) {
     auto sharedState = std::make_shared<SharedState>(ch, storage_);
     waitAndNotify(std::move(awaitable_), sharedState).detach();
-    futures::sleep(duration_).then(
-        [sharedState = std::move(sharedState)] { sharedState->setTimeout(); });
+    futures::sleep(duration_).thenValue(
+        [sharedState = std::move(sharedState)](Unit) {
+          sharedState->setTimeout();
+        });
     return true;
   }
 
@@ -116,7 +104,7 @@ class TimedWaitAwaitable {
         return;
       }
       assume(!storage_.hasValue() && !storage_.hasException());
-      storage_ = Try<await_resume_return_type>(std::move(value));
+      tryEmplace(storage_, static_cast<await_resume_return_type&&>(value));
       ch_();
     }
 
@@ -125,7 +113,7 @@ class TimedWaitAwaitable {
         return;
       }
       assume(!storage_.hasValue() && !storage_.hasException());
-      storage_ = Try<await_resume_return_type>(std::move(e));
+      storage_.emplaceException(std::move(e));
       ch_();
     }
 
@@ -146,7 +134,7 @@ class TimedWaitAwaitable {
       Awaitable awaitable,
       std::shared_ptr<SharedState> sharedState) {
     try {
-      sharedState->setValue(co_await awaitable);
+      sharedState->setValue(co_await std::forward<Awaitable>(awaitable));
     } catch (const std::exception& e) {
       sharedState->setException(exception_wrapper(std::current_exception(), e));
     } catch (...) {

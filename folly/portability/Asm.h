@@ -18,6 +18,8 @@
 
 #include <folly/Portability.h>
 
+#include <cstdint>
+
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif

@@ -20,13 +20,17 @@ namespace detail {
 
 template <typename T>
 template <typename Tag, typename VaultTag>
-SingletonHolder<T>& SingletonHolder<T>::singleton() {
-  /* library-local */ static auto entry =
-      createGlobal<SingletonHolder<T>, std::pair<Tag, VaultTag>>([]() {
-        return new SingletonHolder<T>(
-            {typeid(T), typeid(Tag)}, *SingletonVault::singleton<VaultTag>());
-      });
-  return *entry;
+struct SingletonHolder<T>::Impl : SingletonHolder<T> {
+  Impl()
+      : SingletonHolder<T>(
+            {typeid(T), typeid(Tag)},
+            *SingletonVault::singleton<VaultTag>()) {}
+};
+
+template <typename T>
+template <typename Tag, typename VaultTag>
+inline SingletonHolder<T>& SingletonHolder<T>::singleton() {
+  return detail::createGlobal<Impl<Tag, VaultTag>, void>();
 }
 
 [[noreturn]] void singletonWarnDoubleRegistrationAndAbort(
@@ -52,6 +56,8 @@ void SingletonHolder<T>::registerSingleton(CreateFunc c, TeardownFunc t) {
      *
      * Singleton<int> a([] { return new int(3); });
      * Singleton<int> b([] { return new int(4); });
+     *
+     * Adding tags should fix this (see documentation in the header).
      *
      */
     singletonWarnDoubleRegistrationAndAbort(type());

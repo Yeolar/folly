@@ -20,6 +20,7 @@
 #include <folly/ExceptionWrapper.h>
 #include <folly/SocketAddress.h>
 #include <folly/experimental/TestUtil.h>
+#include <folly/fibers/FiberManagerMap.h>
 #include <folly/io/async/AsyncSSLSocket.h>
 #include <folly/io/async/AsyncServerSocket.h>
 #include <folly/io/async/AsyncSocket.h>
@@ -177,9 +178,9 @@ class ExpectWriteErrorCallback : public WriteCallbackBase {
   ~ExpectWriteErrorCallback() override {
     EXPECT_EQ(STATE_FAILED, state);
     EXPECT_EQ(
-        exception.type_,
+        exception.getType(),
         AsyncSocketException::AsyncSocketExceptionType::NETWORK_ERROR);
-    EXPECT_EQ(exception.errno_, 22);
+    EXPECT_EQ(exception.getErrno(), 22);
     // Suppress the assert in  ~WriteCallbackBase()
     state = STATE_SUCCEEDED;
   }
@@ -211,16 +212,16 @@ class WriteCheckTimestampCallback : public WriteCallbackBase {
   void setSocket(const std::shared_ptr<AsyncSSLSocket>& socket) override {
     WriteCallbackBase::setSocket(socket);
 
-    EXPECT_NE(socket_->getFd(), 0);
+    EXPECT_NE(socket_->getNetworkSocket(), NetworkSocket());
     int flags = SOF_TIMESTAMPING_OPT_ID | SOF_TIMESTAMPING_OPT_TSONLY |
         SOF_TIMESTAMPING_SOFTWARE;
     AsyncSocket::OptionKey tstampingOpt = {SOL_SOCKET, SO_TIMESTAMPING};
-    int ret = tstampingOpt.apply(socket_->getFd(), flags);
+    int ret = tstampingOpt.apply(socket_->getNetworkSocket(), flags);
     EXPECT_EQ(ret, 0);
   }
 
   void checkForTimestampNotifications() noexcept {
-    int fd = socket_->getFd();
+    int fd = socket_->getNetworkSocket().toFd();
     std::vector<char> ctrl(1024, 0);
     unsigned char data;
     struct msghdr msg;
@@ -428,7 +429,7 @@ class WriteErrorCallback : public ReadCallback {
     currentBuffer.length = len;
 
     // close the socket before writing to trigger writeError().
-    ::close(socket_->getFd());
+    ::close(socket_->getNetworkSocket().toFd());
 
     wcb_->setSocket(socket_);
 
@@ -582,7 +583,7 @@ class SSLServerAcceptCallbackDelay : public SSLServerAcceptCallback {
     auto sock = std::static_pointer_cast<AsyncSSLSocket>(s);
 
     std::cerr << "SSLServerAcceptCallbackDelay::connAccepted" << std::endl;
-    int fd = sock->getFd();
+    int fd = sock->getNetworkSocket().toFd();
 
 #ifndef TCP_NOPUSH
     {
@@ -776,7 +777,7 @@ class TestSSLAsyncCacheServer : public TestSSLServer {
   }
 };
 
-void getfds(int fds[2]);
+void getfds(NetworkSocket fds[2]);
 
 void getctx(
     std::shared_ptr<folly::SSLContext> clientCtx,
@@ -914,23 +915,21 @@ class BlockingWriteServer : private AsyncSSLSocket::HandshakeCB,
   std::unique_ptr<uint8_t[]> buf_;
 };
 
-class NpnClient : private AsyncSSLSocket::HandshakeCB,
-                  private AsyncTransportWrapper::WriteCallback {
+class AlpnClient : private AsyncSSLSocket::HandshakeCB,
+                   private AsyncTransportWrapper::WriteCallback {
  public:
-  explicit NpnClient(AsyncSSLSocket::UniquePtr socket)
+  explicit AlpnClient(AsyncSSLSocket::UniquePtr socket)
       : nextProto(nullptr), nextProtoLength(0), socket_(std::move(socket)) {
     socket_->sslConn(this);
   }
 
   const unsigned char* nextProto;
   unsigned nextProtoLength;
-  SSLContext::NextProtocolType protocolType;
   folly::Optional<AsyncSocketException> except;
 
  private:
   void handshakeSuc(AsyncSSLSocket*) noexcept override {
-    socket_->getSelectedNextProtocol(
-        &nextProto, &nextProtoLength, &protocolType);
+    socket_->getSelectedNextProtocol(&nextProto, &nextProtoLength);
   }
   void handshakeErr(
       AsyncSSLSocket*,
@@ -950,23 +949,21 @@ class NpnClient : private AsyncSSLSocket::HandshakeCB,
   AsyncSSLSocket::UniquePtr socket_;
 };
 
-class NpnServer : private AsyncSSLSocket::HandshakeCB,
-                  private AsyncTransportWrapper::ReadCallback {
+class AlpnServer : private AsyncSSLSocket::HandshakeCB,
+                   private AsyncTransportWrapper::ReadCallback {
  public:
-  explicit NpnServer(AsyncSSLSocket::UniquePtr socket)
+  explicit AlpnServer(AsyncSSLSocket::UniquePtr socket)
       : nextProto(nullptr), nextProtoLength(0), socket_(std::move(socket)) {
     socket_->sslAccept(this);
   }
 
   const unsigned char* nextProto;
   unsigned nextProtoLength;
-  SSLContext::NextProtocolType protocolType;
   folly::Optional<AsyncSocketException> except;
 
  private:
   void handshakeSuc(AsyncSSLSocket*) noexcept override {
-    socket_->getSelectedNextProtocol(
-        &nextProto, &nextProtoLength, &protocolType);
+    socket_->getSelectedNextProtocol(&nextProto, &nextProtoLength);
   }
   void handshakeErr(
       AsyncSSLSocket*,
@@ -1313,7 +1310,9 @@ class SSLHandshakeBase : public AsyncSSLSocket::HandshakeCB,
   void handshakeSuc(AsyncSSLSocket*) noexcept override {
     LOG(INFO) << "Handshake success";
     handshakeSuccess_ = true;
-    handshakeTime = socket_->getHandshakeTime();
+    if (socket_) {
+      handshakeTime = socket_->getHandshakeTime();
+    }
   }
 
   void handshakeErr(
@@ -1321,12 +1320,16 @@ class SSLHandshakeBase : public AsyncSSLSocket::HandshakeCB,
       const AsyncSocketException& ex) noexcept override {
     LOG(INFO) << "Handshake error " << ex.what();
     handshakeError_ = true;
-    handshakeTime = socket_->getHandshakeTime();
+    if (socket_) {
+      handshakeTime = socket_->getHandshakeTime();
+    }
   }
 
   // WriteCallback
   void writeSuccess() noexcept override {
-    socket_->close();
+    if (socket_) {
+      socket_->close();
+    }
   }
 
   void writeErr(
@@ -1455,4 +1458,90 @@ class EventBaseAborter : public AsyncTimeout {
   EventBase* eventBase_;
 };
 
+class SSLAcceptEvbRunner : public SSLAcceptRunner {
+ public:
+  explicit SSLAcceptEvbRunner(EventBase* evb) : evb_(evb) {}
+  ~SSLAcceptEvbRunner() override = default;
+
+  void run(Function<int()> acceptFunc, Function<void(int)> finallyFunc)
+      const override {
+    evb_->runInLoop([acceptFunc = std::move(acceptFunc),
+                     finallyFunc = std::move(finallyFunc)]() mutable {
+      finallyFunc(acceptFunc());
+    });
+  }
+
+ protected:
+  EventBase* evb_;
+};
+
+class SSLAcceptErrorRunner : public SSLAcceptEvbRunner {
+ public:
+  explicit SSLAcceptErrorRunner(EventBase* evb) : SSLAcceptEvbRunner(evb) {}
+  ~SSLAcceptErrorRunner() override = default;
+
+  void run(Function<int()> /*acceptFunc*/, Function<void(int)> finallyFunc)
+      const override {
+    evb_->runInLoop(
+        [finallyFunc = std::move(finallyFunc)]() mutable { finallyFunc(-1); });
+  }
+};
+
+class SSLAcceptCloseRunner : public SSLAcceptEvbRunner {
+ public:
+  explicit SSLAcceptCloseRunner(EventBase* evb, folly::AsyncSSLSocket* sock)
+      : SSLAcceptEvbRunner(evb), socket_(sock) {}
+  ~SSLAcceptCloseRunner() override = default;
+
+  void run(Function<int()> acceptFunc, Function<void(int)> finallyFunc)
+      const override {
+    evb_->runInLoop([acceptFunc = std::move(acceptFunc),
+                     finallyFunc = std::move(finallyFunc),
+                     sock = socket_]() mutable {
+      auto ret = acceptFunc();
+      sock->closeNow();
+      finallyFunc(ret);
+    });
+  }
+
+ private:
+  folly::AsyncSSLSocket* socket_;
+};
+
+class SSLAcceptDestroyRunner : public SSLAcceptEvbRunner {
+ public:
+  explicit SSLAcceptDestroyRunner(EventBase* evb, SSLHandshakeBase* base)
+      : SSLAcceptEvbRunner(evb), sslBase_(base) {}
+  ~SSLAcceptDestroyRunner() override = default;
+
+  void run(Function<int()> acceptFunc, Function<void(int)> finallyFunc)
+      const override {
+    evb_->runInLoop([acceptFunc = std::move(acceptFunc),
+                     finallyFunc = std::move(finallyFunc),
+                     sslBase = sslBase_]() mutable {
+      auto ret = acceptFunc();
+      std::move(*sslBase).moveSocket();
+      finallyFunc(ret);
+    });
+  }
+
+ private:
+  SSLHandshakeBase* sslBase_;
+};
+
+class SSLAcceptFiberRunner : public SSLAcceptEvbRunner {
+ public:
+  explicit SSLAcceptFiberRunner(EventBase* evb) : SSLAcceptEvbRunner(evb) {}
+  ~SSLAcceptFiberRunner() override = default;
+
+  void run(Function<int()> acceptFunc, Function<void(int)> finallyFunc)
+      const override {
+    auto& fiberManager = folly::fibers::getFiberManager(*evb_);
+    fiberManager.addTaskFinally(
+        std::move(acceptFunc),
+        [finally = std::move(finallyFunc)](folly::Try<int>&& res) mutable {
+          finally(res.value());
+        });
+  }
+};
 } // namespace folly

@@ -98,6 +98,26 @@ struct Opaque {
 
 } // namespace
 
+TEST(SortedVectorTypes, SetAssignmentInitListTest) {
+  sorted_vector_set<int> s{3, 4, 5};
+  EXPECT_THAT(s, testing::ElementsAreArray({3, 4, 5}));
+  s = {}; // empty ilist assignment
+  EXPECT_THAT(s, testing::IsEmpty());
+  s = {7, 8, 9}; // non-empty ilist assignment
+  EXPECT_THAT(s, testing::ElementsAreArray({7, 8, 9}));
+}
+
+TEST(SortedVectorTypes, MapAssignmentInitListTest) {
+  using v = std::pair<int, const char*>;
+  v p = {3, "a"}, q = {4, "b"}, r = {5, "c"};
+  sorted_vector_map<int, const char*> m{p, q, r};
+  EXPECT_THAT(m, testing::ElementsAreArray({p, q, r}));
+  m = {}; // empty ilist assignment
+  EXPECT_THAT(m, testing::IsEmpty());
+  m = {p, q, r}; // non-empty ilist assignment
+  EXPECT_THAT(m, testing::ElementsAreArray({p, q, r}));
+}
+
 TEST(SortedVectorTypes, SimpleSetTest) {
   sorted_vector_set<int> s;
   EXPECT_TRUE(s.empty());
@@ -163,6 +183,15 @@ TEST(SortedVectorTypes, SimpleSetTest) {
   EXPECT_TRUE(s != cpy);
   EXPECT_TRUE(s != cpy2);
   EXPECT_TRUE(cpy2 == cpy);
+
+  sorted_vector_set<int> s3 = {};
+  s3.insert({1, 2, 3});
+  s3.emplace(4);
+  EXPECT_EQ(s3.size(), 4);
+
+  sorted_vector_set<std::string> s4;
+  s4.emplace("foobar", 3);
+  EXPECT_EQ(s4.count("foo"), 1);
 }
 
 TEST(SortedVectorTypes, TransparentSetTest) {
@@ -288,6 +317,10 @@ TEST(SortedVectorTypes, SimpleMapTest) {
   // Bad insert hint.
   m.insert(m.begin() + 3, std::make_pair(1 << 15, 1.0f));
   check_invariant(m);
+
+  sorted_vector_map<int, float> m4 = {};
+  m4.insert({{1, 1.0f}, {2, 2.0f}, {1, 2.0f}});
+  EXPECT_EQ(m4.at(2), 2.0f);
 }
 
 TEST(SortedVectorTypes, TransparentMapTest) {
@@ -630,7 +663,7 @@ TEST(SortedVectorTypes, TestSetInsertionDupsOneByOne) {
     vset.insert(elem);
   }
   check_invariant(vset);
-  EXPECT_EQ(vset.rbegin()->count_, 3);
+  EXPECT_EQ(vset.rbegin()->count_, 2);
   EXPECT_THAT(
       extractValues(vset), testing::ElementsAreArray({2, 4, 5, 6, 8, 10}));
 }

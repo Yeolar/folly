@@ -392,13 +392,15 @@ class IOBuf {
    * Similar to wrapBuffer(), but returns IOBuf by value rather than
    * heap-allocating it.
    */
-  static IOBuf wrapBufferAsValue(const void* buf, std::size_t capacity);
-  static IOBuf wrapBufferAsValue(ByteRange br) {
+  static IOBuf wrapBufferAsValue(
+      const void* buf,
+      std::size_t capacity) noexcept;
+  static IOBuf wrapBufferAsValue(ByteRange br) noexcept {
     return wrapBufferAsValue(br.data(), br.size());
   }
 
-  IOBuf(WrapBufferOp op, const void* buf, std::size_t capacity);
-  IOBuf(WrapBufferOp op, ByteRange br);
+  IOBuf(WrapBufferOp op, const void* buf, std::size_t capacity) noexcept;
+  IOBuf(WrapBufferOp op, ByteRange br) noexcept;
 
   /**
    * Convenience function to create a new IOBuf object that copies data from a
@@ -911,6 +913,27 @@ class IOBuf {
   }
 
   /**
+   *
+   * Returns the SharedInfo::userData if sharedInfo()
+   * is not nullptr, nullptr otherwise
+   *
+   **/
+  void* getUserData() const {
+    SharedInfo* info = sharedInfo();
+    return info ? info->userData : nullptr;
+  }
+
+  /**
+   *
+   * Returns free function if sharedInfo() is not nullputr, nullptr otherwise
+   *
+   **/
+  FreeFunction getFreeFn() const {
+    SharedInfo* info = sharedInfo();
+    return info ? info->freeFn : nullptr;
+  }
+
+  /**
    * Return true if all IOBufs in this chain are managed by the usual
    * refcounting mechanism (and so the lifetime of the underlying memory
    * can be extended by clone()).
@@ -1091,8 +1114,23 @@ class IOBuf {
    * Returns ByteRange that points to the data IOBuf stores.
    */
   ByteRange coalesce() {
+    const std::size_t newHeadroom = headroom();
+    const std::size_t newTailroom = prev()->tailroom();
+    return coalesceWithHeadroomTailroom(newHeadroom, newTailroom);
+  }
+
+  /**
+   * This is similar to the coalesce() method, except this allows to set a
+   * headroom and tailroom after coalescing.
+   *
+   * Returns ByteRange that points to the data IOBuf stores.
+   */
+  ByteRange coalesceWithHeadroomTailroom(
+      std::size_t newHeadroom,
+      std::size_t newTailroom) {
     if (isChained()) {
-      coalesceSlow();
+      coalesceAndReallocate(
+          newHeadroom, computeChainDataLength(), this, newTailroom);
     }
     return ByteRange(data_, length_);
   }
@@ -1168,10 +1206,26 @@ class IOBuf {
   std::unique_ptr<IOBuf> cloneCoalesced() const;
 
   /**
+   * This is similar to the cloneCoalesced() method, except this allows to set a
+   * headroom and tailroom for the new IOBuf.
+   */
+  std::unique_ptr<IOBuf> cloneCoalescedWithHeadroomTailroom(
+      std::size_t newHeadroom,
+      std::size_t newTailroom) const;
+
+  /**
    * Similar to cloneCoalesced(). But returns IOBuf by value rather than
    * heap-allocating it.
    */
   IOBuf cloneCoalescedAsValue() const;
+
+  /**
+   * This is similar to the cloneCoalescedAsValue() method, except this allows
+   * to set a headroom and tailroom for the new IOBuf.
+   */
+  IOBuf cloneCoalescedAsValueWithHeadroomTailroom(
+      std::size_t newHeadroom,
+      std::size_t newTailroom) const;
 
   /**
    * Similar to Clone(). But use other as the head node. Other nodes in the
@@ -1211,23 +1265,43 @@ class IOBuf {
    */
   void appendToIov(folly::fbvector<struct iovec>* iov) const;
 
+  struct FillIovResult {
+    // How many iovecs were filled (or 0 on error).
+    size_t numIovecs;
+    // The total length of filled iovecs (or 0 on error).
+    size_t totalLength;
+  };
+
   /**
    * Fill an iovec array with the IOBuf data.
    *
-   * Returns the number of iovec filled. If there are more buffer than
-   * iovec, returns 0. This version is suitable to use with stack iovec
-   * arrays.
+   * Returns a struct with two fields: the number of iovec filled, and total
+   * size of the iovecs filled. If there are more buffer than iovec, returns 0
+   * in both fields.
+   * This version is suitable to use with stack iovec arrays.
    *
    * Naturally, the filled iovec data will be invalid if you modify the
    * buffer chain.
    */
-  size_t fillIov(struct iovec* iov, size_t len) const;
+  FillIovResult fillIov(struct iovec* iov, size_t len) const;
 
   /**
    * A helper that wraps a number of iovecs into an IOBuf chain.  If count == 0,
    * then a zero length buf is returned.  This function never returns nullptr.
    */
   static std::unique_ptr<IOBuf> wrapIov(const iovec* vec, size_t count);
+
+  /**
+   * A helper that takes ownerships a number of iovecs into an IOBuf chain.  If
+   * count == 0, then a zero length buf is returned.  This function never
+   * returns nullptr.
+   */
+  static std::unique_ptr<IOBuf> takeOwnershipIov(
+      const iovec* vec,
+      size_t count,
+      FreeFunction freeFn = nullptr,
+      void* userData = nullptr,
+      bool freeOnError = true);
 
   /*
    * Overridden operator new and delete.
@@ -1238,6 +1312,7 @@ class IOBuf {
   void* operator new(size_t size);
   void* operator new(size_t size, void* ptr);
   void operator delete(void* ptr);
+  void operator delete(void* ptr, void* placement);
 
   /**
    * Destructively convert this IOBuf to a fbstring efficiently.
@@ -1300,7 +1375,9 @@ class IOBuf {
 
   struct SharedInfo {
     SharedInfo();
-    SharedInfo(FreeFunction fn, void* arg);
+    SharedInfo(FreeFunction fn, void* arg, bool hfs = false);
+
+    static void releaseStorage(SharedInfo* info);
 
     // A pointer to a function to call to free the buffer when the refcount
     // hits 0.  If this is null, free() will be used instead.
@@ -1308,6 +1385,7 @@ class IOBuf {
     void* userData;
     std::atomic<uint32_t> refcount;
     bool externallyShared{false};
+    bool useHeapFullStorage{false};
   };
   // Helper structs for use by operator new and delete
   struct HeapPrefix;
@@ -1328,7 +1406,7 @@ class IOBuf {
       uint8_t* buf,
       std::size_t capacity,
       uint8_t* data,
-      std::size_t length);
+      std::size_t length) noexcept;
 
   void unshareOneSlow();
   void unshareChained();
@@ -1462,8 +1540,11 @@ class IOBuf {
  * Hasher for IOBuf objects. Hashes the entire chain using SpookyHashV2.
  */
 struct IOBufHash {
-  size_t operator()(const IOBuf& buf) const;
-  size_t operator()(const std::unique_ptr<IOBuf>& buf) const {
+  size_t operator()(const IOBuf& buf) const noexcept;
+  size_t operator()(const std::unique_ptr<IOBuf>& buf) const noexcept {
+    return operator()(buf.get());
+  }
+  size_t operator()(const IOBuf* buf) const noexcept {
     return buf ? (*this)(*buf) : 0;
   }
 };
@@ -1472,10 +1553,15 @@ struct IOBufHash {
  * Ordering for IOBuf objects. Compares data in the entire chain.
  */
 struct IOBufCompare {
-  ordering operator()(const IOBuf& a, const IOBuf& b) const;
+  ordering operator()(const IOBuf& a, const IOBuf& b) const {
+    return &a == &b ? ordering::eq : impl(a, b);
+  }
   ordering operator()(
       const std::unique_ptr<IOBuf>& a,
       const std::unique_ptr<IOBuf>& b) const {
+    return operator()(a.get(), b.get());
+  }
+  ordering operator()(const IOBuf* a, const IOBuf* b) const {
     // clang-format off
     return
         !a && !b ? ordering::eq :
@@ -1484,6 +1570,9 @@ struct IOBufCompare {
         operator()(*a, *b);
     // clang-format on
   }
+
+ private:
+  ordering impl(IOBuf const& a, IOBuf const& b) const noexcept;
 };
 
 /**
@@ -1559,8 +1648,10 @@ inline std::unique_ptr<IOBuf> IOBuf::maybeCopyBuffer(
   return copyBuffer(buf.data(), buf.size(), headroom, minTailroom);
 }
 
-class IOBuf::Iterator
-    : public detail::IteratorFacade<IOBuf::Iterator, ByteRange const> {
+class IOBuf::Iterator : public detail::IteratorFacade<
+                            IOBuf::Iterator,
+                            ByteRange const,
+                            std::forward_iterator_tag> {
  public:
   // Note that IOBufs are stored as a circular list without a guard node,
   // so pos == end is ambiguous (it may mean "begin" or "end").  To solve

@@ -895,15 +895,15 @@ TEST(small_vector, InputIterator) {
 }
 
 TEST(small_vector, NoCopyCtor) {
-  struct Test {
-    Test() = default;
-    Test(const Test&) = delete;
-    Test(Test&&) = default;
+  struct Tester {
+    Tester() = default;
+    Tester(const Tester&) = delete;
+    Tester(Tester&&) = default;
 
     int field = 42;
   };
 
-  small_vector<Test> test(10);
+  small_vector<Tester> test(10);
   ASSERT_EQ(test.size(), 10);
   for (const auto& element : test) {
     EXPECT_EQ(element.field, 42);
@@ -1101,7 +1101,7 @@ TEST(small_vector, SelfMoveAssignmentForVectorOfPair) {
   test.emplace_back(13, 2);
   EXPECT_EQ(test.size(), 1);
   EXPECT_EQ(test[0].first, 13);
-  test = static_cast<decltype(test)&&>(test); // trick clang -Wself-move
+  test = static_cast<decltype(test)&&>(test); // suppress self-move warning
   EXPECT_EQ(test.size(), 1);
   EXPECT_EQ(test[0].first, 13);
 }
@@ -1111,7 +1111,7 @@ TEST(small_vector, SelfCopyAssignmentForVectorOfPair) {
   test.emplace_back(13, 2);
   EXPECT_EQ(test.size(), 1);
   EXPECT_EQ(test[0].first, 13);
-  test = test;
+  test = static_cast<decltype(test)&>(test); // suppress self-assign warning
   EXPECT_EQ(test.size(), 1);
   EXPECT_EQ(test[0].first, 13);
 }
